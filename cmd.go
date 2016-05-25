@@ -195,11 +195,11 @@ func (c *Context) PipeExecf(r io.Reader, format string, a ...interface{}) (strin
 
 		}
 	}
-
 	for i := 0; i < len(cmds); i++ {
 		if i != len(cmds)-1 {
 			errors[i] = cmds[i].Wait()
 		}
+		//TODO wait for the go functions too?
 
 		if c.warn && errors[i] != nil {
 			warnMsg := msgs[i] + " returned error " + errors[i].Error()
@@ -223,10 +223,23 @@ func (c *Context) PipeExecf(r io.Reader, format string, a ...interface{}) (strin
 		}
 	}
 
+	errMsg := ""
 	for i := 0; i < len(cmds); i++ {
 		if errors[i] != nil {
-			return string(result), fmt.Errorf("%s returned error %s", quoteJoin(cmds[i].Args), errors[i])
+			if len(errMsg) != 0 {
+				errMsg += "\n"
+			}
+			errMsg += quoteJoin(cmds[i].Args) + " returned error " + errors[i].Error()
+			stderr := indentLines(string(errorBufs[i].Bytes()), " > ")
+			if len(stderr) > 0 {
+				errMsg += "\n" + stderr
+			}
+
 		}
+	}
+
+	if len(errMsg) != 0 {
+		return string(result), fmt.Errorf("%s", errMsg)
 	}
 
 	return string(result), nil
