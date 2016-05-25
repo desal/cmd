@@ -108,6 +108,10 @@ func indentLines(s string, indent string) string {
 }
 
 func (c *Context) Execf(format string, a ...interface{}) (string, error) {
+	return c.PipeExecf(nil, format, a...)
+}
+
+func (c *Context) PipeExecf(r io.Reader, format string, a ...interface{}) (string, error) {
 	if c.workingDir == "" || c.workingDir == "." {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -122,6 +126,18 @@ func (c *Context) Execf(format string, a ...interface{}) (string, error) {
 		return "", err
 	}
 	errorBufs := make([]bytes.Buffer, len(cmds))
+
+	if r != nil {
+		firstInPipe, err := cmds[0].StdinPipe()
+		if err != nil {
+			return "", fmt.Errorf("StdinPipe Error %v", err.Error())
+		}
+
+		go func() {
+			io.Copy(firstInPipe, r)
+			firstInPipe.Close()
+		}()
+	}
 
 	for i := 0; i < len(cmds)-1; i++ {
 		outPipe, err := cmds[i].StdoutPipe()
