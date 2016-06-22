@@ -70,5 +70,12 @@ func TestShellExec(t *testing.T) {
 	assert.NotNil(t, err)
 	assert.Contains(t, res, "stdout")
 	assert.Contains(t, err.Error(), "> stderr")
+}
 
+func TestShellExecf(t *testing.T) {
+	output := NewTestOutput(t)
+	ctx := NewContext("", output)
+	res, err := ctx.ShellExecf("echo 'stdout'; exit 1")
+	assert.NotNil(t, err)
+	assert.Contains(t, res, "stdout")
 }

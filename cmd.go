@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/desal/richtext"
@@ -243,4 +245,26 @@ func (c *Context) PipeExecf(r io.Reader, format string, a ...interface{}) (strin
 	}
 
 	return string(result), nil
+}
+
+var gEnv = ""
+
+func firstLine(s string) string {
+	return strings.Replace(strings.Split(s, "\n")[0], "\r", "", -1)
+}
+
+//Runs a shell script ala sh -c '...'
+func (c *Context) ShellExecf(format string, a ...interface{}) (string, error) {
+	if gEnv == "" {
+		if runtime.GOOS == "windows" {
+			cygPath, err := c.Execf("cygpath -w '%s'", "/usr/bin/env")
+			if err != nil {
+				return "", err
+			}
+			gEnv = filepath.ToSlash(firstLine(cygPath))
+		} else {
+			gEnv = "/usr/bin/env"
+		}
+	}
+	return c.Execf(fmt.Sprintf(`%s sh -c "%s"`, gEnv, format), a...)
 }

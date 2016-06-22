@@ -7,18 +7,25 @@ import (
 )
 
 type testOutput struct {
-	t      *testing.T
-	format richtext.Format
+	t       *testing.T
+	format  richtext.Format
+	verbose bool
 }
 
 var _ Output = &stdOutput{}
 
 func NewTestOutput(t *testing.T) *testOutput {
-	return &testOutput{t, richtext.Ascii()}
+	return &testOutput{t, richtext.Ascii(), true}
+}
+
+func NewSilencedTestOutput(t *testing.T) *testOutput {
+	return &testOutput{t, richtext.Ascii(), false}
 }
 
 func (o *testOutput) Verbose(format string, a ...interface{}) {
-	o.t.Logf(format, a...)
+	if o.verbose {
+		o.t.Logf(format, a...)
+	}
 }
 
 func (o *testOutput) Warning(format string, a ...interface{}) {
