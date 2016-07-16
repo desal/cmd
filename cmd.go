@@ -6,265 +6,223 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/desal/richtext"
-	"github.com/mattn/go-shellwords"
 )
 
-type (
-	Flag uint
+//go:generate stringer -type Flag
 
-	Output interface {
-		Verbose(format string, a ...interface{})
-		Warning(format string, a ...interface{})
-		Error(format string, a ...interface{})
-		Format() richtext.Format
-	}
+type (
+	empty   struct{}
+	Flag    uint
+	flagSet map[Flag]empty
 
 	Context struct {
 		workingDir string
-		output     Output
-		must       bool
-		warn       bool
-		green      func(format string, a ...interface{}) string
-		bold       func(format string, a ...interface{}) string
+		format     richtext.Format
+		flags      flagSet
+		regular    func(format string, a ...interface{}) (int, error)
+		green      func(format string, a ...interface{}) (int, error)
+		bold       func(format string, a ...interface{}) (int, error)
+	}
+
+	//Returned when the execution was started correctly, but program returned an error
+	Error struct {
+		flags    flagSet
+		ExitCode int
+		CmdLine  string
+		StdErr   string
 	}
 )
 
 const (
-	Must Flag = iota
-	Warn
+	_                 Flag = iota
+	MustPanic              //panic on error
+	MustExit               //Exit on error
+	Warn                   //Errors get a 'Warning' level output
+	NoAnnotate             //When outputting stdout/stderr, the output is passed through unchanged
+	StdErrInResult         //StdErr is included in 'output'
+	PassThrough            //Alias for PassThroughStdOut, PassThroughStdErr & PassThroughStdIn
+	PassThroughStdOut      //Passes through stdout, output will always be an empty string
+	PassThroughStdErr      //StdErr passthrough, error will only contain exit code.
+	PassThroughStdIn
+	TrimSpace
+	FirstLine
+	Strict //does 'set -eu -o pipefail'
+	Verbose
 )
 
-var (
-	shellParser *shellwords.Parser
-)
+func (fs flagSet) Checked(flag Flag) bool {
+	_, ok := fs[flag]
 
-func init() {
-	shellParser = shellwords.NewParser()
-	shellParser.ParseBackSlash = false
+	return ok
 }
 
-func NewContext(workingDir string, output Output, flags ...Flag) *Context {
-	result := &Context{workingDir: workingDir, output: output}
+func newContext(workingDir string, format richtext.Format, flags ...Flag) *Context {
+	c := &Context{workingDir: workingDir, format: format, flags: flagSet{}}
+
 	for _, flag := range flags {
-		switch flag {
-		case Must:
-			result.must = true
-		case Warn:
-			result.warn = true
-		}
+		c.flags[flag] = empty{}
 	}
-	format := output.Format()
-	result.green = format.String(richtext.Green, richtext.None)
-	result.bold = format.String(richtext.None, richtext.None, richtext.Bold)
-	return result
-}
 
-//TODO move from []string to a command struct
-
-func splitCmd(s string) ([]*exec.Cmd, error) {
-	args, err := shellParser.Parse(s)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to parse '%s': %s", s, err.Error())
+	if c.flags.Checked(PassThrough) {
+		c.flags[PassThroughStdIn] = empty{}
+		c.flags[PassThroughStdOut] = empty{}
+		c.flags[PassThroughStdErr] = empty{}
 	}
-	cmds := []*exec.Cmd{}
-	next := []string{}
-	for _, e := range args {
-		if e == "|" {
-			cmds = append(cmds, exec.Command(next[0], next[1:]...))
-			next = nil
-		} else {
-			next = append(next, e)
-		}
+
+	if c.flags.Checked(Verbose) {
+		c.green = format.MakePrintf(richtext.Green, richtext.None)
+		c.bold = format.MakePrintf(richtext.None, richtext.None, richtext.Bold)
+		c.regular = format.MakePrintf(richtext.None, richtext.None)
+
 	}
-	cmds = append(cmds, exec.Command(next[0], next[1:]...))
 
-	return cmds, nil
-}
-
-func quoteJoin(s []string) string {
-	quoted := []string{}
-	for _, e := range s {
-		if strings.Contains(e, " ") {
-			quoted = append(quoted, `"`+e+`"`)
-		} else {
-			quoted = append(quoted, e)
-		}
-	}
-	return strings.Join(quoted, " ")
-}
-
-func indentLines(s string, indent string) string {
-	lines := strings.Split(s, "\n")
-	outLines := []string{}
-	for _, line := range lines {
-		if line != "" {
-			outLines = append(outLines, indent+line)
-		}
-	}
-	return strings.Join(outLines, "\n")
-}
-
-func (c *Context) Execf(format string, a ...interface{}) (string, error) {
-	return c.PipeExecf(nil, format, a...)
-}
-
-func (c *Context) PipeExecf(r io.Reader, format string, a ...interface{}) (string, error) {
 	if c.workingDir == "" || c.workingDir == "." {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return "", fmt.Errorf("Can't get working directory: %s", err.Error())
+			panic(fmt.Errorf("Can't get current working directory: %s", err.Error()))
 		}
 		c.workingDir = cwd
 	}
+	return c
+}
 
-	cmdline := fmt.Sprintf(format, a...)
-	cmds, err := splitCmd(cmdline)
-	if err != nil {
-		return "", err
+func New(workingDir string, format richtext.Format, flags ...Flag) *Context {
+	if err := Check(); err != nil {
+		panic(err)
 	}
-	errorBufs := make([]bytes.Buffer, len(cmds))
+	return newContext(workingDir, format, flags...)
+}
+
+func (c *Context) Execf(format string, a ...interface{}) (string, string, error) {
+	return c.PipeExecf(nil, format, a...)
+}
+
+func (c *Context) PipeExecf(r io.Reader, format string, a ...interface{}) (string, string, error) {
+	cmdLine := fmt.Sprintf(format, a...)
+
+	var cmd *exec.Cmd
+	if c.flags.Checked(Strict) {
+		cmd = exec.Command("sh", "-c", "set -eu -o pipefail; "+cmdLine)
+	} else {
+		cmd = exec.Command("sh", "-c", cmdLine)
+	}
+
+	cmd.Dir = c.workingDir
 
 	if r != nil {
-		firstInPipe, err := cmds[0].StdinPipe()
+		pipeIn, err := cmd.StdinPipe()
+		//Can only fail if pipe is already set, or process started
 		if err != nil {
-			return "", fmt.Errorf("StdinPipe Error %v", err.Error())
+			panic(err)
 		}
 
 		go func() {
-			io.Copy(firstInPipe, r)
-			firstInPipe.Close()
+			io.Copy(pipeIn, r)
+			pipeIn.Close()
 		}()
+	} else if c.flags.Checked(PassThroughStdIn) {
+		cmd.Stdin = os.Stdin
 	}
 
-	for i := 0; i < len(cmds)-1; i++ {
-		outPipe, err := cmds[i].StdoutPipe()
-		if err != nil {
-			return "", fmt.Errorf("StdoutPipe Error %v", err.Error())
-		}
-
-		errPipe, err := cmds[i].StderrPipe()
-		if err != nil {
-			return "", fmt.Errorf("StderrPipe Error %v", err.Error())
-		}
-
-		inPipe, err := cmds[i+1].StdinPipe()
-		if err != nil {
-			return "", fmt.Errorf("StdinPipe Error %v", err.Error())
-		}
-
-		go func() {
-			io.Copy(inPipe, outPipe)
-			inPipe.Close()
-		}()
-
-		go func(i int) {
-			errorBufs[i].ReadFrom(errPipe)
-		}(i)
+	if c.flags.Checked(Verbose) {
+		c.regular("%s", c.workingDir)
+		c.green(" $ ")
+		c.bold("%s", cmdLine)
+		c.regular("\n")
 	}
 
-	var result []byte
-	msgs := make([]string, len(cmds))
-	errors := make([]error, len(cmds))
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
 
-	for i, cmd := range cmds {
-		if i != 0 {
-			msgs[i] += c.bold(" -> ")
-		}
-		msgs[i] += c.workingDir
-		msgs[i] += c.green(" $ ")
-		msgs[i] += c.bold(quoteJoin(cmds[i].Args))
-		cmd.Dir = c.workingDir
-		if i != len(cmds)-1 {
-			err := cmd.Start()
-			if err != nil {
-				return "", fmt.Errorf("Failed to start %s: %s", quoteJoin(cmds[i].Args), err.Error())
-			}
-		} else {
-			errPipe, err := cmds[i].StderrPipe()
-			if err != nil {
-				return "", fmt.Errorf("StderrPipe Error %v", err.Error())
-			}
-			go func() {
-				errorBufs[i].ReadFrom(errPipe)
-			}()
-
-			result, errors[i] = cmd.Output()
-
-		}
+	if c.flags.Checked(PassThroughStdOut) {
+		cmd.Stdout = os.Stdout
+	} else {
+		cmd.Stdout = &stdoutBuf
 	}
-	for i := 0; i < len(cmds); i++ {
-		if i != len(cmds)-1 {
-			errors[i] = cmds[i].Wait()
-		}
-		//TODO wait for the go functions too?
 
-		if c.warn && errors[i] != nil {
-			warnMsg := msgs[i] + " returned error " + errors[i].Error()
-			stderr := indentLines(string(errorBufs[i].Bytes()), " > ")
-			if len(stderr) > 0 {
-				warnMsg += "\n" + stderr
-			}
-			c.output.Warning(warnMsg)
+	if c.flags.Checked(PassThroughStdErr) {
+		cmd.Stderr = os.Stderr
+	} else if c.flags.Checked(StdErrInResult) {
+		cmd.Stderr = &stdoutBuf
+	} else {
+		cmd.Stderr = &stderrBuf
+	}
 
-		} else if c.must && errors[i] != nil {
-			errMsg := msgs[i] + " returned error " + errors[i].Error()
-			stderr := indentLines(string(errorBufs[i].Bytes()), " > ")
-			if len(stderr) > 0 {
-				errMsg += "\n" + stderr
-			}
-			c.output.Error(errMsg)
+	err := c.newError(cmdLine, &stderrBuf, cmd.Run())
+	if err != nil {
+		if c.flags.Checked(MustExit) {
+			c.format.ErrorLine(err.Error())
 			os.Exit(1)
-
-		} else {
-			c.output.Verbose(msgs[i])
+		} else if c.flags.Checked(MustPanic) {
+			panic(err.Error())
+		} else if c.flags.Checked(Warn) {
+			c.format.WarningLine(err.Error())
 		}
 	}
 
-	errMsg := ""
-	for i := 0; i < len(cmds); i++ {
-		if errors[i] != nil {
-			if len(errMsg) != 0 {
-				errMsg += "\n"
-			}
-			errMsg += quoteJoin(cmds[i].Args) + " returned error " + errors[i].Error()
-			stderr := indentLines(string(errorBufs[i].Bytes()), " > ")
-			if len(stderr) > 0 {
-				errMsg += "\n" + stderr
-			}
+	stdout := stdoutBuf.String()
+	stderr := stderrBuf.String()
 
-		}
+	if c.flags.Checked(TrimSpace) {
+		stdout = strings.TrimSpace(stdout)
+		stderr = strings.TrimSpace(stderr)
 	}
 
-	if len(errMsg) != 0 {
-		return string(result), fmt.Errorf("%s", errMsg)
+	if c.flags.Checked(FirstLine) {
+		stdout = strings.Replace(strings.SplitN(stdout, "\n", 2)[0], "\r", "", -1)
 	}
 
-	return string(result), nil
+	return stdout, stderr, err
 }
 
-var gEnv = ""
+func (c *Context) newError(cmdLine string, errorBuf *bytes.Buffer, cmdErr error) error {
+	if cmdErr == nil {
+		return nil
+	}
+	exitErr, isExit := cmdErr.(*exec.ExitError)
+	if !isExit {
+		return cmdErr
+	}
 
-func firstLine(s string) string {
-	return strings.Replace(strings.Split(s, "\n")[0], "\r", "", -1)
+	//Windows and Linux only
+	waitStatus, isWaitStatus := exitErr.Sys().(syscall.WaitStatus)
+	if !isWaitStatus {
+		return fmt.Errorf("exec error was of type ExitError, but could not get WaitStatus")
+	}
+
+	return &Error{
+		flags:    c.flags,
+		ExitCode: waitStatus.ExitStatus(),
+		CmdLine:  cmdLine,
+		StdErr:   errorBuf.String(),
+	}
 }
 
-//Runs a shell script ala sh -c '...'
-func (c *Context) ShellExecf(format string, a ...interface{}) (string, error) {
-	if gEnv == "" {
-		if runtime.GOOS == "windows" {
-			cygPath, err := c.Execf("cygpath -w '%s'", "/usr/bin/env")
-			if err != nil {
-				return "", err
-			}
-			gEnv = filepath.ToSlash(firstLine(cygPath))
-		} else {
-			gEnv = "/usr/bin/env"
-		}
+func (e *Error) Error() string {
+	return e.warnText(false)
+}
+
+func (e *Error) warnText(verbose bool) string {
+	if e.flags.Checked(NoAnnotate) {
+		return e.StdErr
 	}
-	return c.Execf(fmt.Sprintf(`%s sh -c "%s"`, gEnv, format), a...)
+	lines := []string{}
+	if e.flags.Checked(Verbose) {
+		//cmdLine would have already been output
+		lines = append(lines, fmt.Sprintf("  returned %d", e.ExitCode))
+	} else {
+		lines = append(lines, fmt.Sprintf("%s returned %d", e.CmdLine, e.ExitCode))
+	}
+
+	stderr := indentLines(e.StdErr, " > ")
+
+	if len(stderr) > 0 {
+		lines = append(lines, stderr)
+	}
+
+	return strings.Join(lines, "\n")
 }

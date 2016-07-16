@@ -1,81 +1,125 @@
-package cmd
+package cmd_test
 
 import (
+	"bytes"
 	"fmt"
 	"os"
-	"os/exec"
-	"runtime"
 	"testing"
 
+	"github.com/desal/cmd"
+	"github.com/desal/richtext"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestGoGrepGrep(t *testing.T) {
-	output := NewTestOutput(t)
-	ctx := NewContext("", output)
-	res, err := ctx.Execf("go help |grep -v testing|grep description|wc -l")
-	assert.Equal(t, nil, err)
-	assert.Equal(t, []byte{50, 10}, []byte(res))
-}
+func TestMain(m *testing.M) {
+	o, e, err := cmd.New("", richtext.Silenced()).Execf(`
+		rm -f testhelper;
+		go build -o testhelper ./_testhelper
+	`)
 
-func TestGoGrefGrep(t *testing.T) {
-	output := NewTestOutput(t)
-	ctx := NewContext("", output, Warn)
-	res, err := ctx.Execf("go help |gref -v testing|grep description|wc -l")
-	assert.NotEqual(t, nil, err)
-	fmt.Println(res)
-	fmt.Println(err)
-}
-
-func TestGoGrepErrGrep(t *testing.T) {
-	output := NewTestOutput(t)
-	ctx := NewContext("", output, Warn)
-	res, err := ctx.Execf("go help |grep --fail|grep description|wc -l")
-	assert.NotEqual(t, nil, err)
-	fmt.Println(res)
-	fmt.Println(err)
-}
-
-func testGoGrepErrGrepMust(t *testing.T) {
-	output := NewTestOutput(t)
-	ctx := NewContext("", output, Must)
-	res, err := ctx.Execf("go help |grep --fail|grep description|wc -l")
-	assert.NotEqual(t, nil, err)
-	fmt.Println(res)
-	fmt.Println(err)
-}
-
-func TestGoGrepErrGrepMust(t *testing.T) {
-	if os.Getenv("TEST_EXIT") == "1" {
-		testGoGrepErrGrepMust(t)
-		return
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=TestGoGrepErrGrepMust")
-	cmd.Env = append(os.Environ(), "TEST_EXIT=1")
-	err := cmd.Run()
-	e, ok := err.(*exec.ExitError)
-	assert.Equal(t, true, ok)
-	assert.Equal(t, false, e.Success())
-}
-
-func TestShellExec(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Log("Test not supported on windows")
-		return
+	if err != nil {
+		fmt.Println("TEST SETUP FAILED")
+		fmt.Println(o)
+		fmt.Println(e)
+		os.Exit(1)
 	}
 
-	output := NewTestOutput(t)
-	ctx := NewContext("", output)
-	res, err := ctx.Execf("/bin/sh -c \"echo 'stderr' > /dev/stderr; echo 'stdout'; exit 1\"")
-	assert.NotNil(t, err)
-	assert.Contains(t, res, "stdout")
-	assert.Contains(t, err.Error(), "> stderr")
+	result := m.Run()
+
+	o, e, err = cmd.New("", richtext.Silenced()).Execf(`
+		rm -f testhelper;
+	`)
+
+	if err != nil {
+		fmt.Println("TEST CLEANUP FAILED")
+		fmt.Println(o)
+		fmt.Println(e)
+		os.Exit(1)
+	}
+
+	os.Exit(result)
+}
+func TestExecOk(t *testing.T) {
+	stdout, stderr, err := cmd.New("", richtext.Test(t)).Execf(`./testhelper "stdout" "stderr" 0`)
+	assert.Contains(t, stdout, "stdout")
+	assert.Contains(t, stderr, "stderr")
+	assert.Nil(t, err)
 }
 
-func TestShellExecf(t *testing.T) {
-	output := NewTestOutput(t)
-	ctx := NewContext("", output)
-	res, err := ctx.ShellExecf("echo 'stdout'; exit 1")
+func TestExecErr(t *testing.T) {
+	stdout, stderr, err := cmd.New("", richtext.Test(t)).Execf(`./testhelper "stdout" "stderr" 1`)
+	assert.Contains(t, stdout, "stdout")
+	assert.Contains(t, stderr, "stderr")
+	require.NotNil(t, err)
+	cmdErr, ok := err.(*cmd.Error)
+	require.True(t, ok)
+	assert.Equal(t, cmdErr.ExitCode, 1)
+}
+
+func TestBadCommand(t *testing.T) {
+	_, _, err := cmd.New("", richtext.Test(t)).Execf("aoeusnth")
+	require.NotNil(t, err)
+	cmdErr, ok := err.(*cmd.Error)
+	require.True(t, ok)
+	assert.Equal(t, cmdErr.ExitCode, 127)
+}
+
+func TestPipe(t *testing.T) {
+	var rw bytes.Buffer
+	rw.WriteString("a\nb\nc\n")
+	stdout, _, err := cmd.New("", richtext.Test(t), cmd.TrimSpace).PipeExecf(&rw, "wc -l")
+	assert.Nil(t, err)
+	assert.Equal(t, stdout, "3")
+}
+
+func TestCheck(t *testing.T) {
+	assert.Nil(t, cmd.Check())
+	path := os.Getenv("PATH")
+	os.Setenv("PATH", "")
+	assert.NotNil(t, cmd.Check())
+	os.Setenv("PATH", path)
+	assert.Nil(t, cmd.Check())
+}
+
+func TestTrim(t *testing.T) {
+	stdout, _, _ := cmd.New("", richtext.Test(t), cmd.TrimSpace).Execf(
+		"./testhelper ' \n  \n \t stdout  \n  \n ' '' 0")
+	assert.Equal(t, "stdout", stdout)
+}
+
+func TestFirstLine(t *testing.T) {
+	ctx := cmd.New("", richtext.Test(t), cmd.FirstLine)
+
+	stdout, _, _ := ctx.Execf("./testhelper 'one\ntwo\nthree\n' '' 0")
+	assert.Equal(t, "one", stdout)
+
+	stdout, _, _ = ctx.Execf("./testhelper '\ntwo\nthree\n' '' 0")
+	assert.Equal(t, "", stdout)
+	stdout, _, _ = ctx.Execf("./testhelper ' \ntwo' '' 0")
+	assert.Equal(t, " ", stdout)
+
+	ctx = cmd.New("", richtext.Test(t), cmd.FirstLine, cmd.TrimSpace)
+	stdout, _, _ = ctx.Execf("./testhelper '\ntwo\nthree\n' '' 0")
+	assert.Equal(t, "two", stdout)
+	stdout, _, _ = ctx.Execf("./testhelper ' \ntwo' '' 0")
+	assert.Equal(t, "two", stdout)
+
+}
+
+func TestStrict(t *testing.T) {
+	ctx := cmd.New("", richtext.Test(t))
+	_, _, err := ctx.Execf("./testhelper '' '' 1; ./testhelper '' '' 0")
+	assert.Nil(t, err)
+
+	_, _, err = ctx.Execf("./testhelper '' '' 1| wc -l")
+	assert.Nil(t, err)
+
+	ctx = cmd.New("", richtext.Test(t), cmd.Strict)
+	_, _, err = ctx.Execf("./testhelper '' '' 1; ./testhelper '' '' 0")
 	assert.NotNil(t, err)
-	assert.Contains(t, res, "stdout")
+
+	_, _, err = ctx.Execf("./testhelper '' '' 1| wc -l")
+	assert.NotNil(t, err)
+
 }
